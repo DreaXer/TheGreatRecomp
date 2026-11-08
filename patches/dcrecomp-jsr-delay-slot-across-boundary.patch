@@ -1,0 +1,30 @@
+diff --git a/tools/static_recompile.py b/tools/static_recompile.py
+index e29958c..fb20d4e 100644
+--- a/tools/static_recompile.py
++++ b/tools/static_recompile.py
+@@ -1141,6 +1141,25 @@ class SH4Recompiler:
+                 offset += 4
+                 continue
+ 
++            # Same for an indirect call whose delay slot starts the next
++            # function. Without this the call is dropped: pc is set, nothing
++            # dispatches it. It resumes at pc + 4, past the slot, when that is
++            # an entry; otherwise it falls through and the slot runs twice.
++            if (has_delay and target == "indirect"
++                    and ("jsr" in code or "bsrf" in code)
++                    and offset + 2 >= func_end and offset + 2 < self.size):
++                delay_pc = self.offset_to_addr(offset + 2)
++                delay_code, _, _, _ = self.recompile_instruction(
++                    self.read_u16(offset + 2), delay_pc)
++                lines.append(f"    {code}")
++                lines.append(f"    {delay_code} /* delay slot, across boundary */")
++                lines.append(f"    sh4_call_indirect(cpu);")
++                resume = pc + 4
++                if resume in self.functions or resume in getattr(self, "mid_entry_addrs", ()):
++                    lines.append(f"    func_{resume:08X}(cpu); return;")
++                offset += 4
++                continue
++
+             # Handle delay slots for branch instructions
+             if has_delay and offset + 2 < func_end:
+                 delay_opcode = self.read_u16(offset + 2)

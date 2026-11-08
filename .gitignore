@@ -1,0 +1,35 @@
+# Disc images and extracted game data (copyrighted)
+disc/
+extracted/
+*.chd
+*.cue
+*.bin
+*.BIN
+*.gdi
+*.iso
+
+# Build artifacts
+build/
+*.o
+*.obj
+*.exe
+*.dll
+*.pdb
+*.lib
+*.ilk
+
+# IDE
+.vs/
+.vscode/
+*.sln
+*.vcxproj*
+.idea/
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Recompiled game source: a machine translation of the game's executable,
+# so a derivative of it. Generate it from your own disc (see README.md).
+src/game/
+include/game/
