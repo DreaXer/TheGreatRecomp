@@ -1,3 +1,4 @@
-[submodule "dcrecomp"]
-	path = dcrecomp
-	url = https://github.com/sp00nznet/dcrecomp.git
+[submodule "dreamcomp"]
+	path = dreamcomp
+	url = https://github.com/DreaXer/dreamcomp.git
+	branch = rayman2

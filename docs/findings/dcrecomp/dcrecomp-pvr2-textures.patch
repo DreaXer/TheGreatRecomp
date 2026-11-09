@@ -1,0 +1,808 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index b54dd35..253487c 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -56,6 +56,7 @@ add_library(dcrecomp_core STATIC
+     src/hal/arm7.c
+     src/hal/pvr2_ta.c
+     src/hal/pvr2_render.c
++    src/hal/pvr2_tex.c
+     src/platform/platform_sdl2.c
+ )
+ 
+@@ -97,3 +98,8 @@ add_executable(arm7_selftest tests/arm7_selftest.c)
+ target_include_directories(arm7_selftest PRIVATE include)
+ enable_testing()
+ add_test(NAME arm7 COMMAND arm7_selftest)
++
++# Self-check for PVR2 texture decoding: twiddle order, VQ, palettes, mipmaps.
++add_executable(pvr2_tex_selftest tests/pvr2_tex_selftest.c src/hal/pvr2_tex.c)
++target_include_directories(pvr2_tex_selftest PRIVATE include)
++add_test(NAME pvr2_tex COMMAND pvr2_tex_selftest)
+diff --git a/include/hal/dc_hardware.h b/include/hal/dc_hardware.h
+index 8b3ab95..0a328a7 100644
+--- a/include/hal/dc_hardware.h
++++ b/include/hal/dc_hardware.h
+@@ -180,6 +180,12 @@ void dc_hw_raise_istnrm(int bit);
+ /* Pending SB_ISTNRM bits, without counting as a read of the register. */
+ uint32_t dc_hw_get_istnrm(DCHardware *hw);
+ 
++/* A PVR/system register's stored value, without dc_hw_read32's side effects. */
++uint32_t dc_hw_peek_reg(DCHardware *hw, uint32_t addr);
++
++/* The 1024-entry palette RAM at 0x005F9000. */
++const uint32_t *dc_hw_palette(DCHardware *hw);
++
+ /* Pending SB_ISTEXT bits. */
+ uint32_t dc_hw_get_istext(DCHardware *hw);
+ 
+diff --git a/include/hal/pvr2.h b/include/hal/pvr2.h
+index eb25759..e1b9ee9 100644
+--- a/include/hal/pvr2.h
++++ b/include/hal/pvr2.h
+@@ -37,11 +37,21 @@ typedef struct {
+     float r, g, b, a;    /* Base color (RGBA 0-1) */
+ } PVR2RenderVertex;
+ 
++/* A run of triangles in one list sharing one polygon header. */
++typedef struct {
++    int first;           /* first vertex in the list */
++    uint32_t pcw, isp, tsp, tcw;
++} PVR2Batch;
++
++#define PVR2_MAX_BATCHES   16384
++
+ /* Per-list triangle buffer */
+ typedef struct {
+     PVR2RenderVertex *vertices;
+     int count;
+     int capacity;
++    PVR2Batch *batches;
++    int batch_count;
+ } PVR2TriList;
+ 
+ /* ========== TA FIFO API ========== */
+@@ -85,11 +95,13 @@ int pvr2_screenshot(const char *path);
+  * draws to the window instead, so the two would fight. */
+ int pvr2_ta_has_drawn(void);
+ 
+-/* Draw the PVR2 scanout framebuffer as a fullscreen quad. `fb_addr` is FB_R_SOF1
+- * and `fb_ctrl` is FB_R_CTRL, whose low bits select the pixel format. Returns
+- * the number of non-black pixels, which is a useful "is anything there yet"
+- * signal during bring-up. */
+-int pvr2_present_framebuffer(uint32_t fb_addr, uint32_t fb_ctrl, int width, int height);
++/* Draw the PVR2 scanout framebuffer as a fullscreen quad. `fb_addr`/`fb_addr2`
++ * are FB_R_SOF1/SOF2 (the second is the odd field when interlaced), `fb_ctrl`
++ * is FB_R_CTRL (bits 3:2 select the pixel format) and `fb_size` FB_R_SIZE, or
++ * 0 for a packed width x height buffer. Returns the number of non-black pixels,
++ * which is a useful "is anything there yet" signal during bring-up. */
++int pvr2_present_framebuffer(uint32_t fb_addr, uint32_t fb_addr2, uint32_t fb_ctrl,
++                             uint32_t fb_size, int width, int height);
+ 
+ /* Resize viewport */
+ void pvr2_render_resize(int width, int height);
+diff --git a/include/hal/pvr2_tex.h b/include/hal/pvr2_tex.h
+new file mode 100644
+index 0000000..d8ce36a
+--- /dev/null
++++ b/include/hal/pvr2_tex.h
+@@ -0,0 +1,31 @@
++/**
++ * PowerVR2 texture decoding
++ *
++ * Turns a polygon's TCW/TSP pair and the VRAM it points at into RGBA8 texels.
++ * No OpenGL here: the renderer uploads what this produces.
++ */
++
++#ifndef PVR2_TEX_H
++#define PVR2_TEX_H
++
++#include <stdint.h>
++
++/* Texture size from the TSP: 8 << n for U (bits 5:3) and V (bits 2:0). */
++#define PVR2_TSP_TEXU(tsp)  (8 << (((tsp) >> 3) & 7))
++#define PVR2_TSP_TEXV(tsp)  (8 << ((tsp) & 7))
++
++/* Twiddled (Morton) index of texel (x, y) in a w x h texture. V takes the low
++ * bit of each pair; a rectangle is a run of min(w,h) squares along its long
++ * side. */
++uint32_t pvr2_twiddle(uint32_t x, uint32_t y, uint32_t w, uint32_t h);
++
++/* Decode the top level of the texture described by tcw/tsp into out, w*h*4
++ * bytes of R,G,B,A. pal is the 1024-word palette RAM, pal_ctrl PAL_RAM_CTRL,
++ * text_control TEXT_CONTROL (stride). Returns 0, or -1 if it does not fit in
++ * VRAM. */
++int pvr2_tex_decode(const uint8_t *vram, uint32_t vram_size,
++                    uint32_t tcw, uint32_t tsp,
++                    const uint32_t *pal, uint32_t pal_ctrl, uint32_t text_control,
++                    uint8_t *out);
++
++#endif /* PVR2_TEX_H */
+diff --git a/src/hal/dc_hardware.c b/src/hal/dc_hardware.c
+index 96e0dff..4234805 100644
+--- a/src/hal/dc_hardware.c
++++ b/src/hal/dc_hardware.c
+@@ -921,6 +921,15 @@ uint32_t dc_hw_get_istnrm(DCHardware *hw) {
+     return hw ? hw->sb_istnrm : 0;
+ }
+ 
++uint32_t dc_hw_peek_reg(DCHardware *hw, uint32_t addr) {
++    if (!hw || addr < 0x005F6800 || addr >= 0x005FA000) return 0;
++    return hw->hw_regs[hw_reg_idx(addr)];
++}
++
++const uint32_t *dc_hw_palette(DCHardware *hw) {
++    return hw ? &hw->hw_regs[hw_reg_idx(0x005F9000)] : NULL;
++}
++
+ uint32_t dc_hw_get_istext(DCHardware *hw) {
+     return hw ? hw->sb_istext : 0;
+ }
+@@ -941,8 +950,9 @@ void dc_pvr_wait_vblank(DCHardware *hw) {
+     static int nopresent = -1;
+     if (nopresent < 0) nopresent = getenv("DCRECOMP_NO_PRESENT") ? 1 : 0;
+     if (!nopresent && !pvr2_ta_has_drawn() &&
+-        pvr2_present_framebuffer(hw->pvr_fb_addr1,
++        pvr2_present_framebuffer(hw->pvr_fb_addr1, hw->pvr_fb_addr2,
+                                  hw->hw_regs[hw_reg_idx(PVR_FB_R_CTRL)],
++                                 hw->hw_regs[hw_reg_idx(0x005F805C)],  /* FB_R_SIZE */
+                                  DC_SCREEN_W, DC_SCREEN_H) > 0)
+         platform_swap_buffers();
+     platform_poll_events(hw);
+diff --git a/src/hal/pvr2_render.c b/src/hal/pvr2_render.c
+index cbe9b88..c08b917 100644
+--- a/src/hal/pvr2_render.c
++++ b/src/hal/pvr2_render.c
+@@ -1,11 +1,14 @@
+ /**
+  * PowerVR2 OpenGL Renderer
+  *
+- * Renders PVR2 triangle lists using OpenGL 3.3 core.
+- * Currently renders colored triangles without texturing.
++ * Renders PVR2 triangle lists using OpenGL 3.3 core, one draw per batch of
++ * triangles sharing a polygon header, textured from VRAM. Not yet: fog,
++ * offset colour, modifier volumes, ISP depth modes.
+  */
+ 
+ #include "hal/pvr2.h"
++#include "hal/pvr2_tex.h"
++#include "hal/dc_hardware.h"
+ #include "recompiler/sh4_cpu.h"
+ #include <stdlib.h>
+ #include <stdio.h>
+@@ -19,16 +22,19 @@ static GLuint g_shader;
+ static GLuint g_vao;
+ static GLuint g_vbo;
+ static GLint  g_uniform_screen_size;
++static GLint  g_u_tex, g_u_shade, g_u_ignore_a, g_u_use_alpha, g_u_punch, g_u_alpha_ref;
+ static int    g_width = 640;
+ static int    g_height = 480;
+ 
+-/* Vertex shader: PVR2 screen-space coords → NDC */
++/* Vertex shader: PVR2 screen-space coords → NDC. z is 1/w, so UV*z and z
++ * interpolated linearly in screen space give perspective-correct UVs. */
+ static const char *vert_shader_src =
+     "#version 330 core\n"
+     "layout(location = 0) in vec3 aPos;\n"
+     "layout(location = 1) in vec2 aUV;\n"
+     "layout(location = 2) in vec4 aColor;\n"
+     "out vec4 vColor;\n"
++    "noperspective out vec3 vUVW;\n"
+     "uniform vec2 uScreenSize;\n"
+     "void main() {\n"
+     "    float x = (aPos.x / uScreenSize.x) * 2.0 - 1.0;\n"
+@@ -36,17 +42,107 @@ static const char *vert_shader_src =
+     "    float z = clamp(aPos.z * 0.0001, 0.0, 1.0);\n"
+     "    gl_Position = vec4(x, y, z, 1.0);\n"
+     "    vColor = aColor;\n"
++    "    float w = max(aPos.z, 1e-7);\n"
++    "    vUVW = vec3(aUV * w, w);\n"
+     "}\n";
+ 
+-/* Fragment shader: pass-through color */
++/* Fragment shader: TSP shading instruction over the texture, punch-through
++ * alpha test. */
+ static const char *frag_shader_src =
+     "#version 330 core\n"
+     "in vec4 vColor;\n"
++    "noperspective in vec3 vUVW;\n"
+     "out vec4 FragColor;\n"
++    "uniform sampler2D uTexS;\n"
++    "uniform int uTex, uShade, uIgnoreA, uUseAlpha, uPunch;\n"
++    "uniform float uAlphaRef;\n"
+     "void main() {\n"
+-    "    FragColor = vColor;\n"
++    "    vec4 c = vColor;\n"
++    "    if (uUseAlpha == 0) c.a = 1.0;\n"
++    "    if (uTex == 1) {\n"
++    "        vec4 t = texture(uTexS, vUVW.xy / vUVW.z);\n"
++    "        if (uIgnoreA == 1) t.a = 1.0;\n"
++    "        if (uShade == 0)      c = t;\n"
++    "        else if (uShade == 1) c = vec4(t.rgb * c.rgb, t.a);\n"
++    "        else if (uShade == 2) c = vec4(mix(c.rgb, t.rgb, t.a), c.a);\n"
++    "        else                  c = t * c;\n"
++    "    }\n"
++    "    if (uPunch == 1 && c.a < uAlphaRef) discard;\n"
++    "    FragColor = c;\n"
+     "}\n";
+ 
++/* ---- Texture cache ----------------------------------------------------- */
++
++/* shortcut: every texture is re-decoded once per frame it is used, since
++ * nothing tracks VRAM writes; add dirty tracking if decode shows up in profiles. */
++#define TEX_CACHE_SIZE 4096
++static struct { uint32_t tcw, tsp; unsigned frame; GLuint tex; } g_tex_cache[TEX_CACHE_SIZE];
++static unsigned g_frame = 1;
++static uint8_t *g_tex_buf;
++
++static GLuint get_texture(uint32_t tcw, uint32_t tsp) {
++    tsp &= 0x3F;   /* only the size bits change the decode */
++    uint32_t h = (tcw * 2654435761u) ^ (tsp * 40503u);
++    for (int probe = 0; probe < 16; probe++) {
++        int i = (int)((h + (uint32_t)probe) % TEX_CACHE_SIZE);
++        if (g_tex_cache[i].tex && g_tex_cache[i].tcw == tcw && g_tex_cache[i].tsp == tsp &&
++            g_tex_cache[i].frame == g_frame)
++            return g_tex_cache[i].tex;
++        if (g_tex_cache[i].tex && g_tex_cache[i].frame == g_frame) continue;
++
++        if (!g_tex_buf) g_tex_buf = (uint8_t *)malloc(1024 * 1024 * 4);
++        if (!g_tex_buf) return 0;
++        DCHardware *hw = sh4_get_hardware();
++        const uint32_t *pal = dc_hw_palette(hw);
++        if (!pal) return 0;
++        pvr2_tex_decode(sh4_get_vram_ptr(), DC_VRAM_SIZE, tcw, tsp, pal,
++                        dc_hw_peek_reg(hw, 0x005F8108),  /* PAL_RAM_CTRL */
++                        dc_hw_peek_reg(hw, 0x005F80E4),  /* TEXT_CONTROL */
++                        g_tex_buf);
++        if (!g_tex_cache[i].tex) glGenTextures(1, &g_tex_cache[i].tex);
++        glBindTexture(GL_TEXTURE_2D, g_tex_cache[i].tex);
++        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, PVR2_TSP_TEXU(tsp), PVR2_TSP_TEXV(tsp), 0,
++                     GL_RGBA, GL_UNSIGNED_BYTE, g_tex_buf);
++        g_tex_cache[i].tcw = tcw;
++        g_tex_cache[i].tsp = tsp;
++        g_tex_cache[i].frame = g_frame;
++        return g_tex_cache[i].tex;
++    }
++    return 0;  /* cache full this frame: draw untextured */
++}
++
++static GLint wrap_mode(int clamp, int flip) {
++    return clamp ? GL_CLAMP_TO_EDGE : flip ? GL_MIRRORED_REPEAT : GL_REPEAT;
++}
++
++static const GLenum k_blend_src[8] = {
++    GL_ZERO, GL_ONE, GL_DST_COLOR, GL_ONE_MINUS_DST_COLOR,
++    GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_DST_ALPHA, GL_ONE_MINUS_DST_ALPHA };
++static const GLenum k_blend_dst[8] = {
++    GL_ZERO, GL_ONE, GL_SRC_COLOR, GL_ONE_MINUS_SRC_COLOR,
++    GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_DST_ALPHA, GL_ONE_MINUS_DST_ALPHA };
++
++/* Bind the texture and set the uniforms for one batch. */
++static void set_batch_state(const PVR2Batch *b, int list) {
++    uint32_t tsp = b->tsp;
++    int textured = (b->pcw >> 3) & 1;
++    GLuint tex = textured ? get_texture(b->tcw, tsp) : 0;
++    glUniform1i(g_u_tex, tex ? 1 : 0);
++    if (tex) {
++        glBindTexture(GL_TEXTURE_2D, tex);
++        GLint filt = ((tsp >> 13) & 3) ? GL_LINEAR : GL_NEAREST;
++        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filt);
++        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filt);
++        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, wrap_mode((tsp >> 16) & 1, (tsp >> 18) & 1));
++        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, wrap_mode((tsp >> 15) & 1, (tsp >> 17) & 1));
++    }
++    glUniform1i(g_u_shade, (int)((tsp >> 6) & 3));
++    glUniform1i(g_u_ignore_a, (int)((tsp >> 19) & 1));
++    glUniform1i(g_u_use_alpha, (int)((tsp >> 20) & 1));
++    if (list == PVR2_LIST_TRANS)
++        glBlendFunc(k_blend_src[(tsp >> 29) & 7], k_blend_dst[(tsp >> 26) & 7]);
++}
++
+ static GLuint compile_shader(GLenum type, const char *source) {
+     GLuint shader = glCreateShader(type);
+     glShaderSource(shader, 1, &source, NULL);
+@@ -101,6 +197,12 @@ int pvr2_render_init(int width, int height) {
+     glDeleteShader(fs);
+ 
+     g_uniform_screen_size = glGetUniformLocation(g_shader, "uScreenSize");
++    g_u_tex       = glGetUniformLocation(g_shader, "uTex");
++    g_u_shade     = glGetUniformLocation(g_shader, "uShade");
++    g_u_ignore_a  = glGetUniformLocation(g_shader, "uIgnoreA");
++    g_u_use_alpha = glGetUniformLocation(g_shader, "uUseAlpha");
++    g_u_punch     = glGetUniformLocation(g_shader, "uPunch");
++    g_u_alpha_ref = glGetUniformLocation(g_shader, "uAlphaRef");
+ 
+     /* Create VAO/VBO */
+     glGenVertexArrays(1, &g_vao);
+@@ -194,7 +296,8 @@ static void fb_init(void) {
+     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+ }
+ 
+-int pvr2_present_framebuffer(uint32_t fb_addr, uint32_t fb_ctrl, int width, int height) {
++int pvr2_present_framebuffer(uint32_t fb_addr, uint32_t fb_addr2, uint32_t fb_ctrl,
++                             uint32_t fb_size, int width, int height) {
+     const uint8_t *vram = sh4_get_vram_ptr();
+     if (!vram || width <= 0 || height <= 0)
+         return 0;
+@@ -205,18 +308,43 @@ int pvr2_present_framebuffer(uint32_t fb_addr, uint32_t fb_ctrl, int width, int
+     if (!g_fb_pixels)
+         return 0;
+ 
+-    /* FB_R_CTRL bits 2:0 select the scanout format. */
+-    int fmt = (int)(fb_ctrl & 0x7);
++    /* FB_R_CTRL: bit 0 enable, bit 1 line double, bits 3:2 depth. */
++    int fmt = (int)((fb_ctrl >> 2) & 3);
++    static const int k_bpp[4] = { 2, 2, 3, 4 };
++    int bpp = k_bpp[fmt];
+     uint32_t base = fb_addr & 0x00FFFFFF;
+     if (base >= DC_VRAM_SIZE)
+         base = 0;
++    uint32_t base2 = fb_addr2 & 0x00FFFFFF;
++    if (base2 >= DC_VRAM_SIZE)
++        base2 = base;
++
++    /* FB_R_SIZE: line width in 32-bit words - 1, lines - 1, and the modulus
++     * (words from the end of one line to the next, plus one). */
++    uint32_t line_bytes = (uint32_t)width * (uint32_t)bpp, stride = line_bytes;
++    int fb_h = height;
++    if (fb_size) {
++        line_bytes = ((fb_size & 0x3FF) + 1) * 4;
++        fb_h = (int)((fb_size >> 10) & 0x3FF) + 1;
++        uint32_t mod = (fb_size >> 20) & 0x3FF;
++        stride = line_bytes + (mod ? mod - 1 : 0) * 4;
++    }
++    int fb_w = (int)(line_bytes / (uint32_t)bpp);
++    /* Interlaced: odd lines come from the second field at FB_R_SOF2. */
++    int interlace = (dc_hw_peek_reg(sh4_get_hardware(), 0x005F80D0) >> 4) & 1;  /* SPG_CONTROL */
++    int line_double = (fb_ctrl >> 1) & 1;
+ 
+     int nonzero = 0;
+     for (int y = 0; y < height; y++) {
++        int sy = (interlace || line_double) ? y >> 1 : y;
++        uint32_t row = ((interlace && (y & 1)) ? base2 : base) + (uint32_t)sy * stride;
+         for (int x = 0; x < width; x++) {
+             uint32_t r = 0, g = 0, b = 0;
+-            if (fmt == 0 || fmt == 1) {                 /* RGB555 / RGB565 */
+-                uint32_t off = base + (uint32_t)(y * width + x) * 2;
++            uint32_t sx = (uint32_t)(x * fb_w / width);
++            if (sy >= fb_h) {
++                /* below the framebuffer: black */
++            } else if (fmt == 0 || fmt == 1) {          /* RGB555 / RGB565 */
++                uint32_t off = row + sx * 2;
+                 if (off + 1 >= DC_VRAM_SIZE) continue;
+                 uint16_t p = (uint16_t)(vram[off] | (vram[off + 1] << 8));
+                 if (fmt == 0) {
+@@ -230,12 +358,12 @@ int pvr2_present_framebuffer(uint32_t fb_addr, uint32_t fb_ctrl, int width, int
+                 }
+                 if (p) nonzero++;
+             } else if (fmt == 2) {                      /* RGB888, 3 bytes */
+-                uint32_t off = base + (uint32_t)(y * width + x) * 3;
++                uint32_t off = row + sx * 3;
+                 if (off + 2 >= DC_VRAM_SIZE) continue;
+                 b = vram[off]; g = vram[off + 1]; r = vram[off + 2];
+                 if (r | g | b) nonzero++;
+-            } else {                                    /* 0888 / 8888 */
+-                uint32_t off = base + (uint32_t)(y * width + x) * 4;
++            } else {                                    /* 0888 */
++                uint32_t off = row + sx * 4;
+                 if (off + 3 >= DC_VRAM_SIZE) continue;
+                 b = vram[off]; g = vram[off + 1]; r = vram[off + 2];
+                 if (r | g | b) nonzero++;
+@@ -310,6 +438,8 @@ void pvr2_render_frame(void) {
+ 
+     glUseProgram(g_shader);
+     glUniform2f(g_uniform_screen_size, (float)g_width, (float)g_height);
++    glActiveTexture(GL_TEXTURE0);
++    g_frame++;
+ 
+     glBindVertexArray(g_vao);
+     /* Bind our own buffer before uploading into it. A vertex array object
+@@ -336,17 +466,25 @@ void pvr2_render_frame(void) {
+                      (GLsizeiptr)(list->count * sizeof(PVR2RenderVertex)),
+                      list->vertices, GL_STREAM_DRAW);
+ 
+-        /* Blending for translucent list */
++        /* Blending for translucent list; each batch sets its own factors */
+         if (draw_order[i] == PVR2_LIST_TRANS) {
+             glEnable(GL_BLEND);
+-            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+             glDepthMask(GL_FALSE);
+         } else {
+             glDisable(GL_BLEND);
+             glDepthMask(GL_TRUE);
+         }
+-
+-        glDrawArrays(GL_TRIANGLES, 0, list->count);
++        glUniform1i(g_u_punch, draw_order[i] == PVR2_LIST_PUNCHTHRU);
++        glUniform1f(g_u_alpha_ref,
++                    (dc_hw_peek_reg(sh4_get_hardware(), 0x005F811C) & 0xFF) / 255.0f); /* PT_ALPHA_REF */
++
++        for (int b = 0; b < list->batch_count; b++) {
++            int first = list->batches[b].first;
++            int end = b + 1 < list->batch_count ? list->batches[b + 1].first : list->count;
++            if (end <= first) continue;
++            set_batch_state(&list->batches[b], draw_order[i]);
++            glDrawArrays(GL_TRIANGLES, first, end - first);
++        }
+     }
+ 
+     /* Reset state */
+@@ -372,8 +510,8 @@ int pvr2_render_init(int w, int h) {
+ }
+ void pvr2_render_destroy(void) {}
+ void pvr2_render_frame(void) {}
+-int pvr2_present_framebuffer(uint32_t a, uint32_t c, int w, int h) {
+-    (void)a; (void)c; (void)w; (void)h; return 0;
++int pvr2_present_framebuffer(uint32_t a, uint32_t a2, uint32_t c, uint32_t s, int w, int h) {
++    (void)a; (void)a2; (void)c; (void)s; (void)w; (void)h; return 0;
+ }
+ void pvr2_render_resize(int w, int h) { (void)w; (void)h; }
+ int pvr2_screenshot(const char *path) { (void)path; return -1; } /* nothing drawn to read back */
+diff --git a/src/hal/pvr2_ta.c b/src/hal/pvr2_ta.c
+index cf5e2bb..36a5341 100644
+--- a/src/hal/pvr2_ta.c
++++ b/src/hal/pvr2_ta.c
+@@ -50,6 +50,13 @@ static struct {
+ 
+ /* ========== Helpers ========== */
+ 
++/* 16-bit UV: the top halves of two floats, U in the high word. */
++static void unpack_uv16(uint32_t packed, float *u, float *v) {
++    union { uint32_t u; float f; } c;
++    c.u = packed & 0xFFFF0000u; *u = c.f;
++    c.u = packed << 16;         *v = c.f;
++}
++
+ static void unpack_color(uint32_t packed, float *r, float *g, float *b, float *a) {
+     *a = ((packed >> 24) & 0xFF) / 255.0f;
+     *r = ((packed >> 16) & 0xFF) / 255.0f;
+@@ -64,6 +71,18 @@ static void emit_triangle_vertex(const PVR2RenderVertex *v) {
+     PVR2TriList *tl = &g_ta.lists[list];
+     if (tl->count >= tl->capacity) return;
+ 
++    /* A new batch whenever the header the renderer needs changes. Only at a
++     * triangle boundary, so a batch never splits a triangle. */
++    if (tl->count % 3 == 0) {
++        PVR2Batch *last = tl->batch_count ? &tl->batches[tl->batch_count - 1] : NULL;
++        if (!last || last->pcw != g_ta.pcw || last->isp != g_ta.isp ||
++            last->tsp != g_ta.tsp || last->tcw != g_ta.tcw) {
++            if (tl->batch_count >= PVR2_MAX_BATCHES) return;
++            tl->batches[tl->batch_count++] = (PVR2Batch){
++                tl->count, g_ta.pcw, g_ta.isp, g_ta.tsp, g_ta.tcw };
++        }
++    }
++
+     tl->vertices[tl->count++] = *v;
+ }
+ 
+@@ -262,8 +281,7 @@ static void ta_process_vertex(const uint32_t *data) {
+         c.u = data[1]; v.x = c.f;
+         c.u = data[2]; v.y = c.f;
+         c.u = data[3]; v.z = c.f;
+-        /* 16-bit UV packed in data[4] - skip for now */
+-        v.u = 0; v.v = 0;
++        unpack_uv16(data[4], &v.u, &v.v);
+         unpack_color(data[6], &v.r, &v.g, &v.b, &v.a);
+         break;
+ 
+@@ -280,6 +298,17 @@ static void ta_process_vertex(const uint32_t *data) {
+         c.u = data[11]; v.b = c.f;
+         break;
+ 
++    case 6: /* Textured, float RGBA, 16-bit UV (64-byte) */
++        c.u = data[1]; v.x = c.f;
++        c.u = data[2]; v.y = c.f;
++        c.u = data[3]; v.z = c.f;
++        unpack_uv16(data[4], &v.u, &v.v);
++        c.u = data[8];  v.a = c.f;
++        c.u = data[9];  v.r = c.f;
++        c.u = data[10]; v.g = c.f;
++        c.u = data[11]; v.b = c.f;
++        break;
++
+     case 7: /* Textured, intensity, 32-bit UV */
+         c.u = data[1]; v.x = c.f;
+         c.u = data[2]; v.y = c.f;
+@@ -299,7 +328,7 @@ static void ta_process_vertex(const uint32_t *data) {
+         c.u = data[1]; v.x = c.f;
+         c.u = data[2]; v.y = c.f;
+         c.u = data[3]; v.z = c.f;
+-        v.u = 0; v.v = 0;
++        unpack_uv16(data[4], &v.u, &v.v);
+         c.u = data[6]; {
+             float intensity = c.f;
+             v.r = g_ta.face_r * intensity;
+@@ -322,6 +351,13 @@ static void ta_process_vertex(const uint32_t *data) {
+             c.u = data[off[k][2]]; q[k].z = c.f;
+             unpack_color(g_ta.sprite_color, &q[k].r, &q[k].g, &q[k].b, &q[k].a);
+         }
++        /* Textured sprites carry 16-bit UVs for A, B and C; D = A + C - B. */
++        if (g_ta.vert_type == 16) {
++            for (int k = 0; k < 3; k++)
++                unpack_uv16(data[13 + k], &q[k].u, &q[k].v);
++            q[3].u = q[0].u + q[2].u - q[1].u;
++            q[3].v = q[0].v + q[2].v - q[1].v;
++        }
+         /* Two triangles, sharing the A-C diagonal. */
+         emit_triangle_vertex(&q[0]); emit_triangle_vertex(&q[1]);
+         emit_triangle_vertex(&q[2]);
+@@ -414,6 +450,8 @@ void pvr2_ta_init(void) {
+         g_ta.lists[i].vertices = (PVR2RenderVertex *)calloc(
+             PVR2_MAX_VERTICES, sizeof(PVR2RenderVertex));
+         g_ta.lists[i].count = 0;
++        g_ta.lists[i].batches = (PVR2Batch *)calloc(PVR2_MAX_BATCHES, sizeof(PVR2Batch));
++        g_ta.lists[i].batch_count = 0;
+     }
+ 
+     g_ta.current_list = -1;
+@@ -425,6 +463,8 @@ void pvr2_ta_destroy(void) {
+     for (int i = 0; i < PVR2_NUM_LISTS; i++) {
+         free(g_ta.lists[i].vertices);
+         g_ta.lists[i].vertices = NULL;
++        free(g_ta.lists[i].batches);
++        g_ta.lists[i].batches = NULL;
+     }
+ }
+ 
+@@ -496,6 +536,7 @@ void pvr2_ta_reset(void) {
+ 
+     for (int i = 0; i < PVR2_NUM_LISTS; i++) {
+         g_ta.lists[i].count = 0;
++        g_ta.lists[i].batch_count = 0;
+     }
+     g_ta.strip_count = 0;
+     g_ta.awaiting_second = 0;
+diff --git a/src/hal/pvr2_tex.c b/src/hal/pvr2_tex.c
+new file mode 100644
+index 0000000..8c97ce8
+--- /dev/null
++++ b/src/hal/pvr2_tex.c
+@@ -0,0 +1,156 @@
++/**
++ * PowerVR2 texture decoding
++ *
++ * TCW: [20:0] address in 64-bit units, [25] stride select, [26] scan order
++ * (1 = not twiddled), [29:27] pixel format, [30] VQ, [31] mipmapped. Palette
++ * formats reuse [26:21] as the palette selector and are always twiddled.
++ */
++
++#include "hal/pvr2_tex.h"
++#include <string.h>
++
++enum { FMT_1555, FMT_565, FMT_4444, FMT_YUV422, FMT_BUMP, FMT_PAL4, FMT_PAL8, FMT_RES };
++
++/* Offset of the top mip level, in texels, indexed by log2(size). The levels
++ * are stored smallest first; 16bpp multiplies by 2, PAL8 by 1, PAL4 halves. */
++static const uint32_t k_mip_point[11] = {
++    0x00003, 0x00004, 0x00008, 0x00018, 0x00058, 0x00158,
++    0x00558, 0x01558, 0x05558, 0x15558, 0x55558 };
++/* The same for VQ, in index bytes past the codebook. */
++static const uint32_t k_vq_mip_point[11] = {
++    0x00000, 0x00001, 0x00002, 0x00006, 0x00016, 0x00056,
++    0x00156, 0x00556, 0x01556, 0x05556, 0x15556 };
++
++uint32_t pvr2_twiddle(uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
++    uint32_t m = w < h ? w : h;
++    uint32_t idx = 0;
++    int sh = 0;
++    for (uint32_t b = 1; b < m; b <<= 1) {
++        if (y & b) idx |= 1u << sh;
++        sh++;
++        if (x & b) idx |= 1u << sh;
++        sh++;
++    }
++    uint32_t block = w > h ? x / m : y / m;
++    return idx + block * m * m;
++}
++
++static int ilog2(uint32_t v) { int n = 0; while (v > 1) { v >>= 1; n++; } return n; }
++
++static void put(uint8_t *o, uint32_t r, uint32_t g, uint32_t b, uint32_t a) {
++    o[0] = (uint8_t)r; o[1] = (uint8_t)g; o[2] = (uint8_t)b; o[3] = (uint8_t)a;
++}
++
++static void unpack16(uint16_t p, int fmt, uint8_t *o) {
++    switch (fmt) {
++    case FMT_565:
++        put(o, ((p >> 11) & 0x1F) * 255 / 31, ((p >> 5) & 0x3F) * 255 / 63,
++            (p & 0x1F) * 255 / 31, 255);
++        break;
++    case FMT_4444:
++        put(o, ((p >> 8) & 0xF) * 17, ((p >> 4) & 0xF) * 17, (p & 0xF) * 17,
++            ((p >> 12) & 0xF) * 17);
++        break;
++    case FMT_BUMP: /* shortcut: bump maps read as flat grey, until lighting needs them */
++        put(o, 128, 128, 128, 255);
++        break;
++    default: /* 1555, and the reserved format reads like it */
++        put(o, ((p >> 10) & 0x1F) * 255 / 31, ((p >> 5) & 0x1F) * 255 / 31,
++            (p & 0x1F) * 255 / 31, (p & 0x8000) ? 255 : 0);
++        break;
++    }
++}
++
++static uint32_t clamp8(int v) { return v < 0 ? 0 : v > 255 ? 255 : (uint32_t)v; }
++
++/* One texel of a YUV422 pair: word0 = Y0<<8 | U, word1 = Y1<<8 | V. */
++static void unpack_yuv(uint16_t w0, uint16_t w1, int odd, uint8_t *o) {
++    int u = (w0 & 0xFF) - 128, v = (w1 & 0xFF) - 128;
++    int y = odd ? (w1 >> 8) : (w0 >> 8);
++    put(o, clamp8(y + (11 * v) / 8), clamp8(y - (11 * u) / 32 - (23 * v) / 32),
++        clamp8(y + (111 * u) / 64), 255);
++}
++
++static void unpack_pal(uint32_t e, uint32_t pal_ctrl, uint8_t *o) {
++    if ((pal_ctrl & 3) == 3)
++        put(o, (e >> 16) & 0xFF, (e >> 8) & 0xFF, e & 0xFF, e >> 24);
++    else
++        unpack16((uint16_t)e, (int)(pal_ctrl & 3), o);
++}
++
++int pvr2_tex_decode(const uint8_t *vram, uint32_t vram_size,
++                    uint32_t tcw, uint32_t tsp,
++                    const uint32_t *pal, uint32_t pal_ctrl, uint32_t text_control,
++                    uint8_t *out) {
++    uint32_t w = PVR2_TSP_TEXU(tsp), h = PVR2_TSP_TEXV(tsp);
++    uint32_t addr = (tcw & 0x1FFFFF) << 3;
++    int fmt = (tcw >> 27) & 7;
++    int vq = (tcw >> 30) & 1;
++    int mip = (tcw >> 31) & 1;
++    int pal_fmt = fmt == FMT_PAL4 || fmt == FMT_PAL8;
++    int twiddled = pal_fmt || vq || !((tcw >> 26) & 1);
++    int stride = !pal_fmt && !twiddled && ((tcw >> 25) & 1);
++    uint32_t pitch = stride ? (text_control & 0x1F) * 32 : w;
++    if (stride && pitch == 0) pitch = w;
++    int lg = ilog2(w);
++
++    /* Bytes the texture covers, to check it against VRAM once. */
++    uint32_t data = addr, span;
++    if (vq) {
++        data = addr + 2048;
++        if (mip) data += k_vq_mip_point[lg];
++        span = data - addr + (w / 2) * (h / 2);
++    } else {
++        if (mip) {
++            uint32_t mp = k_mip_point[lg];
++            data += fmt == FMT_PAL4 ? mp / 2 : fmt == FMT_PAL8 ? mp : mp * 2;
++        }
++        uint32_t texels = pitch * h;
++        span = data - addr + (fmt == FMT_PAL4 ? texels / 2 : fmt == FMT_PAL8 ? texels : texels * 2);
++    }
++    if (addr >= vram_size || span > vram_size - addr) {
++        memset(out, 0xFF, (size_t)w * h * 4);
++        return -1;
++    }
++
++    uint32_t pal_base = fmt == FMT_PAL4 ? ((tcw >> 21) & 0x3F) << 4
++                                        : ((tcw >> 25) & 3) << 8;
++
++    for (uint32_t y = 0; y < h; y++) {
++        for (uint32_t x = 0; x < w; x++) {
++            uint8_t *o = out + ((size_t)y * w + x) * 4;
++            if (vq) {
++                uint32_t code = vram[data + pvr2_twiddle(x / 2, y / 2, w / 2, h / 2)];
++                uint32_t e = addr + code * 8 + pvr2_twiddle(x & 1, y & 1, 2, 2) * 2;
++                uint16_t p = (uint16_t)(vram[e] | vram[e + 1] << 8);
++                if (fmt == FMT_YUV422) { /* shortcut: VQ YUV decodes as luma only, until a game uses it */
++                    uint32_t l = p >> 8;
++                    put(o, l, l, l, 255);
++                } else {
++                    unpack16(p, fmt, o);
++                }
++            } else if (fmt == FMT_PAL4) {
++                uint32_t i = pvr2_twiddle(x, y, w, h);
++                uint32_t nib = (vram[data + i / 2] >> ((i & 1) * 4)) & 0xF;
++                unpack_pal(pal[(pal_base + nib) & 1023], pal_ctrl, o);
++            } else if (fmt == FMT_PAL8) {
++                uint32_t i = pvr2_twiddle(x, y, w, h);
++                unpack_pal(pal[(pal_base + vram[data + i]) & 1023], pal_ctrl, o);
++            } else if (fmt == FMT_YUV422) {
++                /* Pairs run along U; twiddled pairs are the two texels of a
++                 * 2x2 block that share a row. */
++                uint32_t x0 = x & ~1u;
++                uint32_t i0 = twiddled ? pvr2_twiddle(x0, y, w, h) : y * pitch + x0;
++                uint32_t i1 = twiddled ? pvr2_twiddle(x0 + 1, y, w, h) : i0 + 1;
++                uint16_t w0 = (uint16_t)(vram[data + i0 * 2] | vram[data + i0 * 2 + 1] << 8);
++                uint16_t w1 = (uint16_t)(vram[data + i1 * 2] | vram[data + i1 * 2 + 1] << 8);
++                unpack_yuv(w0, w1, (int)(x & 1), o);
++            } else {
++                if (stride && x >= pitch) { put(o, 0, 0, 0, 0); continue; }
++                uint32_t i = twiddled ? pvr2_twiddle(x, y, w, h) : y * pitch + x;
++                unpack16((uint16_t)(vram[data + i * 2] | vram[data + i * 2 + 1] << 8), fmt, o);
++            }
++        }
++    }
++    return 0;
++}
+diff --git a/tests/pvr2_tex_selftest.c b/tests/pvr2_tex_selftest.c
+new file mode 100644
+index 0000000..9f359e9
+--- /dev/null
++++ b/tests/pvr2_tex_selftest.c
+@@ -0,0 +1,86 @@
++/* Self-check for PVR2 texture decoding. Covers the parts that are silent when
++ * wrong: twiddle order (square and rectangular), the scan-order and palette
++ * bits, VQ codebook lookup, the mip offset and the VRAM bounds check.
++ *
++ *   cl /nologo /I include tests\pvr2_tex_selftest.c src\hal\pvr2_tex.c && pvr2_tex_selftest.exe
++ */
++
++#undef NDEBUG   /* the checks are the test; keep them in Release builds */
++#include "hal/pvr2_tex.h"
++#include <assert.h>
++#include <stdio.h>
++#include <string.h>
++
++static uint8_t vram[0x10000];
++static uint32_t pal[1024];
++static uint8_t out[64 * 64 * 4];
++
++#define TSP_8x8   0x00u            /* U = V = 8 */
++#define TSP_16x8  (1u << 3)        /* U = 16, V = 8 */
++#define FMT(f)    ((uint32_t)(f) << 27)
++#define SCAN      (1u << 26)       /* not twiddled */
++
++static void put16(uint32_t off, uint16_t v) { vram[off] = (uint8_t)v; vram[off + 1] = (uint8_t)(v >> 8); }
++static const uint8_t *px(int w, int x, int y) { return out + ((size_t)y * w + x) * 4; }
++
++int main(void) {
++    /* Twiddle: V takes the low bit. */
++    assert(pvr2_twiddle(0, 0, 8, 8) == 0);
++    assert(pvr2_twiddle(0, 1, 8, 8) == 1);
++    assert(pvr2_twiddle(1, 0, 8, 8) == 2);
++    assert(pvr2_twiddle(1, 1, 8, 8) == 3);
++    assert(pvr2_twiddle(0, 2, 8, 8) == 4);
++    assert(pvr2_twiddle(2, 0, 8, 8) == 8);
++    assert(pvr2_twiddle(7, 7, 8, 8) == 63);
++    /* 16x8 is two 8x8 squares side by side. */
++    assert(pvr2_twiddle(8, 0, 16, 8) == 64);
++    assert(pvr2_twiddle(9, 1, 16, 8) == 67);
++
++    /* Non-twiddled 565: texel (2,1) red. */
++    memset(vram, 0, sizeof vram);
++    put16((1 * 8 + 2) * 2, 0xF800);
++    assert(pvr2_tex_decode(vram, sizeof vram, FMT(1) | SCAN, TSP_8x8, pal, 0, 0, out) == 0);
++    assert(px(8, 2, 1)[0] == 255 && px(8, 2, 1)[1] == 0 && px(8, 2, 1)[3] == 255);
++    assert(px(8, 1, 2)[0] == 0);
++
++    /* Twiddled 1555 at address 0x800 (tcw units of 8): texel (1,0) is index 2. */
++    memset(vram, 0, sizeof vram);
++    put16(0x800 + 2 * 2, 0x801F);   /* opaque blue */
++    assert(pvr2_tex_decode(vram, sizeof vram, FMT(0) | (0x800 >> 3), TSP_8x8, pal, 0, 0, out) == 0);
++    assert(px(8, 1, 0)[2] == 255 && px(8, 1, 0)[3] == 255);
++    assert(px(8, 0, 1)[3] == 0);
++
++    /* PAL8, selector 1 (entries 256..511), ARGB8888 palette. */
++    memset(vram, 0, sizeof vram);
++    pal[256 + 5] = 0xFF00FF00u;
++    vram[pvr2_twiddle(3, 2, 8, 8)] = 5;
++    assert(pvr2_tex_decode(vram, sizeof vram, FMT(6) | (1u << 25), TSP_8x8, pal, 3, 0, out) == 0);
++    assert(px(8, 3, 2)[1] == 255 && px(8, 3, 2)[0] == 0 && px(8, 3, 2)[3] == 255);
++
++    /* PAL4, selector 2 (entries 32..47): odd index takes the high nibble. */
++    memset(vram, 0, sizeof vram);
++    pal[32 + 9] = 0xFFFF0000u;
++    { uint32_t i = pvr2_twiddle(0, 1, 8, 8); vram[i / 2] = (uint8_t)(9 << ((i & 1) * 4)); }
++    assert(pvr2_tex_decode(vram, sizeof vram, FMT(5) | (2u << 21), TSP_8x8, pal, 3, 0, out) == 0);
++    assert(px(8, 0, 1)[0] == 255 && px(8, 0, 0)[0] == 0);
++
++    /* VQ 565: block (1,0) uses code 7; its texel (1,0) is codebook slot 2. */
++    memset(vram, 0, sizeof vram);
++    put16(7 * 8 + 2 * 2, 0x07E0);   /* green */
++    vram[2048 + pvr2_twiddle(1, 0, 4, 4)] = 7;
++    assert(pvr2_tex_decode(vram, sizeof vram, FMT(1) | (1u << 30), TSP_8x8, pal, 0, 0, out) == 0);
++    assert(px(8, 3, 0)[1] == 255 && px(8, 2, 0)[1] == 0);
++
++    /* Mipmapped 16bpp 8x8: the top level starts 0x18 texels in. */
++    memset(vram, 0, sizeof vram);
++    put16(0x18 * 2, 0xF800);
++    assert(pvr2_tex_decode(vram, sizeof vram, FMT(1) | (1u << 31), TSP_8x8, pal, 0, 0, out) == 0);
++    assert(px(8, 0, 0)[0] == 255);
++
++    /* Past the end of VRAM: refused, filled white. */
++    assert(pvr2_tex_decode(vram, sizeof vram, FMT(1) | (0x1FFFFF), TSP_16x8, pal, 0, 0, out) == -1);
++    assert(px(16, 0, 0)[0] == 255);
++
++    printf("pvr2_tex selftest: ok\n");
++    return 0;
++}

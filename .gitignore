@@ -1,35 +1,38 @@
-# Disc images and extracted game data (copyrighted)
-disc/
-extracted/
-*.chd
+# ============================================================
+#  NO GAME DATA IN THIS REPOSITORY. EVER.
+#  Rayman 2: The Great Escape is (c) 1999-2000 Ubi Soft Entertainment.
+#  This repository ships configuration and original code only;
+#  every player supplies their own disc image.
+#  `python dreamcomp/tools/audit.py assets --repo .` enforces it.
+# ============================================================
 *.cue
+*.gdi
+*.cdi
+*.chd
+*.iso
 *.bin
 *.BIN
-*.gdi
-*.iso
+*.PVR
+*.DAT
+*.vmu
+*.vms
+*.vmi
 
-# Build artifacts
-build/
-*.o
-*.obj
-*.exe
-*.dll
-*.pdb
-*.lib
-*.ilk
+# Extracted from the owner's disc by tools/dc.py setup
+game/extracted/
+game/suggested.toml
 
-# IDE
-.vs/
-.vscode/
-*.sln
-*.vcxproj*
-.idea/
+# Build output and machine-local state
+build*/
+.dreamcomp/
+shots/
+traces/
+*.ppm
+*.log
+CLAUDE.local.md
+.claude/settings.local.json
+__pycache__/
 
-# OS
-Thumbs.db
-.DS_Store
-
-# Recompiled game source: a machine translation of the game's executable,
-# so a derivative of it. Generate it from your own disc (see README.md).
-src/game/
-include/game/
+# The owner's disc image and anything extracted from it
+disc/
+extracted/

@@ -1,0 +1,53 @@
+# Rayman 2: The Great Escape (USA), 17707N V1.003 (2000-02-22) -- dreamcomp game config.
+# Format: dreamcomp/engine/docs/game-config.md. Measured on the owner's disc
+# (docs/GAME-INTERNALS.md says how); nothing from the disc itself is ever committed.
+
+[game]
+id = "rayman2"
+title = "Rayman 2: The Great Escape"
+region = "USA"
+product = "17707N"
+
+[disc]
+# SHA-1 of the plain 1ST_READ.BIN (935,648 bytes) this config was measured against.
+sha1_1st_read = "0bee95a8c55d3b22f363c6ac35205540b2710c7d"
+
+[binary]
+path = "extracted/fs/1ST_READ.BIN"   # written by tools/dc.py setup, git-ignored
+load_address = 0x8C010000
+link_address = 0x0C010000
+entry = 0x8C010000
+
+# Katana copies its exception/interrupt stubs below the load address; VBR is 0x8C000000, so the
+# interrupt entry is VBR+0x600. All four from --suggest-config, first 1800-frame boot
+# (2026-11-08): 0x8C000600 and 0x8C000000 were the untranslated targets of every interrupt.
+[[relocations]]  # RAM 0x8c000000 reproduces image 0x0c0e3974 for 52 bytes
+source = 0x0C0E3974
+size = 0x34
+dest = 0x8C000000
+
+[[relocations]]  # RAM 0x8c000100 reproduces image 0x0c0e38e0 for 60 bytes
+source = 0x0C0E38E0
+size = 0x3C
+dest = 0x8C000100
+
+[[relocations]]  # RAM 0x8c000400 reproduces image 0x0c0e38e0 for 60 bytes
+source = 0x0C0E38E0
+size = 0x3C
+dest = 0x8C000400
+
+[[relocations]]  # RAM 0x8c000600 reproduces image 0x0c0e3918 for 96 bytes (interrupt entry)
+source = 0x0C0E3918
+size = 0x60
+dest = 0x8C000600
+
+[functions]
+# --suggest-config, same run: in the image, never reached by discovery, 9351 calls in 1800 frames.
+extra = [0x0C01D532,
+         # Windowed `dc.py shots` run with start@600 (2026-11-08): one call each.
+         0x0C0E618E, 0x0C0E6198,
+         # Reached once the full display lists were drawn (TA context fix, 2026-11-09):
+         # report with start@600, 1 call.
+         0x0C038D20]
+
+# [hooks]: see dreamcomp docs/HOOKS.md.
