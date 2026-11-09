@@ -36,3 +36,6 @@ __pycache__/
 # The owner's disc image and anything extracted from it
 disc/
 extracted/
+
+# F11 frame captures (display list, VRAM: game data)
+capture-*

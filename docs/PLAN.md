@@ -11,7 +11,7 @@
 | Phase | Entry gate | Exit criteria (visible behaviour) | Status |
 |---|---|---|---|
 | 00 Survey | disc present | identity, SDK, files recorded | done 2026-11-08 (`findings/phase-00.md`) |
-| 01 Boot | config builds | menus reachable; 0 untranslated / 0 unmapped over 1800 frames | in progress: 0 / 0 over 3000 frames with start@600,a@1500,a@2000; title screen complete and the VMU menu drawn over the waterfall (2026-11-09, after the TA buffer fix); Ubi Soft logo frames still black; gameplay not reached |
+| 01 Boot | config builds | menus reachable; 0 untranslated / 0 unmapped over 1800 frames | in progress: 0 / 0 over 3000 frames with start@600,a@1500,a@2000; title screen complete and the VMU menu drawn over the waterfall (2026-11-09, after the TA buffer fix); Ubi Soft logo frames still black; gameplay reached 2026-11-09: 0 / 0 over 22000 frames (VMU menu, jump pack, main menu, New Game, intro cutscene, Rayman controlled in the prison-ship cell) |
 | 02 Audio | 01 | music + effects audible | |
 | 03 Full play | 02 | complete playthrough, saves load | |
 | 04 Enhancements | 03 | per dc-enhance | |
@@ -27,3 +27,5 @@
 
 | Date | Port commit | dreamcomp commit | What was confirmed, by whom |
 |---|---|---|---|
+| 2026-11-09 | d9a001b | 7ce6d63 | Claude, `dc.py shots` up to frame 22000 (`start@600,a@1500,a@2000,a@2600,a@3200,a@3800,start@4400,a@5100,start@6000,start@7000,start@8000,a@9000`, then `a` every 1000 frames from 13500): game created on the VMU, intro cutscene with subtitles, Globox tutorial in the cell, Rayman moving; 0 untranslated, 0 unmapped. Not played by hand yet |
+| 2026-11-09 | d9a001b + uncommitted | 7ce6d63 + uncommitted | User, window at 180 Hz with interpolation: 16:9 through the game's own RESOLUTION option and Aspect ratio = Expanded works; after the interpolation fixes (dreamcomp engine-changes 2026-11-09) no more torn characters, lines in water and cliffs, cut trees, VMU-menu HUD jumps or name-entry letter jumps |

@@ -37,6 +37,27 @@ Two parameter buffers, alternating each frame: object lists at 0x000000 / 0x4000
 Never writes `TA_LIST_CONT`. The engine had to keep one display list per buffer (dreamcomp
 `docs/engine-changes.md`, playbook T26); before that only the cliffs were drawn.
 
+## Cutscene letterbox (2026-11-09)
+
+The bands are not a smaller viewport: the camera keeps the full 640x480 view and the game draws
+two quads over it, last in the opaque list (`dreamcomp_ta_dump` on frame 12500 of PLAN.md's
+sequence, intro cutscene in the cell). The user saw them fade in and out over the picture.
+
+| Quad | y | Words |
+|---|---|---|
+| top | 0 - 19 | `pcw=808c0182` (untextured), `isp=80000001`, `tsp=20800000`, all four vertices `base ff000000`, z = 4 |
+| bottom | 367 - 480 | same |
+
+Clip registers stay full screen through the cutscene (`FB_X_CLIP` 0x027F0000, `FB_Y_CLIP`
+0x01DF0000, `TA_GLOB_TILE_CLIP` 0x000E0013). Subtitles are drawn in the translucent list at
+z = 512 inside the bottom band, so they stay readable without it.
+
+`src/rayman2.cpp` drops them when the Graphics setting **Cutscene bars** (`cinema_bars`) is off:
+untextured quads, black (RGB 0, any alpha, for the fade), flat z, x 0 - 640, touching y = 0 or
+y = 480, less than 200 high (a full-screen fade is kept). Checked: frame 12500 shows the whole
+picture with the subtitle in place; the user confirmed it in play. Not checked: other cutscenes,
+and whether a gameplay screen draws a matching quad (none seen in the cell).
+
 ## Title screen and attract demo
 
 The title screen plays a recorded demo behind the logo (inference: the stream is read about
