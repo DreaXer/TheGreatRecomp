@@ -137,6 +137,24 @@ centred, text ~505x55 px as at 16:9; 0 untranslated / 0 unmapped over 23000 fram
 resizing (user, first version); Ubi Soft and Rayman 2 logos of a new game (user, window,
 final version). Not checked: what else uses orthographic cameras, other levels' HUD.
 
+## Texts (2026-11-09)
+
+`DCDATA/TEXTS/<LANGUAGE>.LNG` (ENGLISH, FRENCH, GERMAN, ITALIAN, SPANISH): a table of absolute
+pointers, then NUL-terminated strings; loaded at 0x8CCCBB00 (every language's first pointer is
+0x8CCCC8DC, already resolved for that base; English label found at base + 0x5F28 in RAM). The
+font shows `;` as `/` ("16;9"). Format codes: `/L:` new line, `/C:` centred, `/oN:` offset. French
+strings use no byte >= 0x80; the others do (umlauts, accented vowels).
+
+The resolution label and the "restore 16:9 mode?" question (none in Spanish) are renamed by
+`src/rayman2.cpp` each vblank (user's request: the mode follows the window): EN `ADJUSTED`,
+FR `AJUSTE`, DE `Angepasst`, IT `Adattata`, ES `AJUSTADO`, each fitting the original length;
+strings are matched by length + FNV-1a so no game text is in the source. The TV message
+"PLEASE SWITCH YOUR TELEVISION SET TO" reuses the label. Checked in the VIDEO menu and the TV
+message (shots), all five languages: the language comes from the console flash, so a scratch
+copy of the synthesised flash (`--dump-flash`) had its language set (factory digits at
+0x1A003/0x1A0A3, syscfg block 5 byte 5 with its CRC) and was passed with `--flash`. The font
+draws every letter upper case. Not checked: the "restore" question (where the game asks it).
+
 ## Title screen and attract demo
 
 The title screen plays a recorded demo behind the logo (inference: the stream is read about
