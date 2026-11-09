@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <string>
+#include <unordered_map>
 
 #include "dream/render/display_list.h"
 #include "dream/runtime/system.h"
@@ -65,39 +66,68 @@ bool game_wide(dream::Memory& m) { return m.read8(kWideFlag) != 0; }
 constexpr std::uint32_t kSavedMode = 0x8C2D0F4C;  // 1 = 16:9 saved
 constexpr std::uint32_t kMode = 0x8C2D0F44;       // the menu's current setting
 
+// The widening each perspective camera was last derived with, and the cam+136 it then got. Some
+// cameras are derived only when created (the intro logo's, drawn and placed with it), so when
+// the window changes shape their fields keep the old widening: rescale them to the new one
+// (below), and unproject undoes the one they hold. An entry whose cam+136 no longer matches was
+// re-derived, changed or freed: it is dropped, never written.
+struct CamWiden {
+    float k, f136;
+};
+std::unordered_map<std::uint32_t, CamWiden> g_cam_widen;
+
+float effective_widen(dream::Memory& m) { return game_wide(m) ? g_fov_widen : 1.0f; }
+
+void rescale_stale_cameras(dream::Memory& m) {
+    const float k = effective_widen(m);
+    for (auto it = g_cam_widen.begin(); it != g_cam_widen.end();) {
+        const std::uint32_t cam = it->first;
+        CamWiden& w = it->second;
+        if (dreamcomp::read_f32(m, cam + 136) != w.f136) {
+            it = g_cam_widen.erase(it);
+            continue;
+        }
+        if (w.k != k) {  // cam+136 = 0.1 / tan(h/2), cam+144 = -3200 tan(h/2) / tan(v/2)
+            w.f136 *= w.k / k;
+            dreamcomp::write_f32(m, cam + 136, w.f136);
+            dreamcomp::write_f32(m, cam + 144, dreamcomp::read_f32(m, cam + 144) * k / w.k);
+            w.k = k;
+        }
+        ++it;
+    }
+}
+
 void apply_widescreen(dream::System& sys, float aspect) {
     g_fov_widen = aspect > 4.0f / 3.0f + 0.01f ? aspect / kGameWide : 1.0f;
     if (game_wide(sys.memory))
         dreamcomp::write_f32(sys.memory, kHudScale, (1.0f / 1.2f) / g_fov_widen);
+    rescale_stale_cameras(sys.memory);
 }
 
 }  // namespace
 
-// fn_0c037134(?, viewport, cam) derives each camera's projection, clip planes and culling every
-// frame from cam+120 (horizontal) and cam+124 (vertical). Perspective types 102/103: cam+120 is
-// the FOV (radians, full angle), widened for the call only, so cameras whose FOV is set once
-// (pause menu) widen too and nothing compounds. Orthographic types 100/101 (intro logos,
-// drawn at the near plane): type 101 copies cam+120 into cam+124, so widening cam+120 grew the
-// logos both ways; instead their x scale cam+140 is narrowed after the call, which keeps them
-// at their 16:9 size, centred, like the HUD.
+// fn_0c037134(?, viewport, cam) derives each camera's projection, clip planes and culling from
+// cam+120 (horizontal) and cam+124 (vertical); most cameras every frame. Perspective types
+// 102/103: cam+120 is the FOV (radians, full angle), widened for the call only, so cameras
+// whose FOV is set once (pause menu) widen too and nothing compounds. Orthographic types
+// 100/101: type 101 copies cam+120 into cam+124, so only their x scale cam+140 is narrowed,
+// after the call.
 namespace {
-std::uint32_t g_cam = 0;  // camera the entry hook changed, 0 = none (no recursion seen)
-float g_cam_h = 0.0f, g_cam_wide = 0.0f;
+std::uint32_t g_cam = 0;  // camera the entry hook saw, 0 = none (no recursion seen)
+std::uint32_t g_cam_type = 0;
+float g_cam_h = 0.0f, g_cam_wide = 0.0f, g_cam_k = 1.0f;
 }  // namespace
 
 DC_HOOK_ENTRY(project_camera) {
-    g_cam = 0;
-    if (g_fov_widen == 1.0f || !game_wide(m))
-        return false;
-    const std::uint32_t cam = c.r[6];
-    const std::uint32_t type = m.read32(cam + 8);
-    const float h = dreamcomp::read_f32(m, cam + 120);
-    if (type == 100 || type == 101) {
-        g_cam = cam, g_cam_h = 0.0f;
-    } else if ((type == 102 || type == 103) && h > 0.0f && h < 3.0f) {
-        g_cam = cam, g_cam_h = h;
-        g_cam_wide = 2.0f * std::atan(std::tan(h * 0.5f) * g_fov_widen);
-        dreamcomp::write_f32(m, cam + 120, g_cam_wide);
+    g_cam = c.r[6];
+    g_cam_type = m.read32(g_cam + 8);
+    g_cam_k = effective_widen(m);
+    g_cam_h = dreamcomp::read_f32(m, g_cam + 120);
+    g_cam_wide = g_cam_h;
+    const bool persp = (g_cam_type == 102 || g_cam_type == 103) && g_cam_h > 0.0f && g_cam_h < 3.0f;
+    if (persp && g_cam_k != 1.0f) {
+        g_cam_wide = 2.0f * std::atan(std::tan(g_cam_h * 0.5f) * g_cam_k);
+        dreamcomp::write_f32(m, g_cam + 120, g_cam_wide);
     }
     return false;
 }
@@ -105,10 +135,18 @@ DC_HOOK_ENTRY(project_camera) {
 DC_HOOK_EXIT(project_camera) {
     if (!g_cam)
         return;
-    if (g_cam_h == 0.0f)  // orthographic
-        dreamcomp::write_f32(m, g_cam + 140, dreamcomp::read_f32(m, g_cam + 140) / g_fov_widen);
-    else if (dreamcomp::read_f32(m, g_cam + 120) == g_cam_wide)  // unless the call re-derived it
-        dreamcomp::write_f32(m, g_cam + 120, g_cam_h);
+    if (g_cam_type == 100 || g_cam_type == 101) {
+        if (g_cam_k != 1.0f)
+            dreamcomp::write_f32(m, g_cam + 140, dreamcomp::read_f32(m, g_cam + 140) / g_cam_k);
+    } else if (g_cam_type == 102 || g_cam_type == 103) {
+        if (dreamcomp::read_f32(m, g_cam + 120) == g_cam_wide) {  // unless the call re-derived it
+            dreamcomp::write_f32(m, g_cam + 120, g_cam_h);
+            g_cam_widen[g_cam] = {g_cam_wide != g_cam_h ? g_cam_k : 1.0f,
+                                  dreamcomp::read_f32(m, g_cam + 136)};
+        } else {
+            g_cam_widen.erase(g_cam);
+        }
+    }
     g_cam = 0;
 }
 
@@ -116,9 +154,24 @@ DC_HOOK_EXIT(project_camera) {
 // 0x8C04C73C (pr 0x0C04C740). The loader's own exit is never reached by an exit hook (not
 // investigated), so the mode is set right after that field. Set it as the menu's fn_0c04c31e
 // does; each camera then takes the mode through fn_0c037134's own check (camera mode != flag
-// -> fn_0c03703a), as after a menu toggle. A 4:3 save leaves the boot default alone.
+// -> fn_0c03703a), as after a menu toggle. Applied both ways: the boot may already have set
+// the remembered mode (below).
+//
+// The VMU menu (and so the load) comes ~25 s after boot, and the screens before it would be
+// stretched in a wide window. So the port remembers the mode in its settings (`game_mode` =
+// adjusted / 4:3) when a save is loaded and when the player switches it in the VIDEO menu
+// (fn_0c04c31e called from the menu, 0x0C030640; not the Raycap level's forced 4:3), and sets
+// it right after the game's boot reset fn_0c04c3c0 (frame 307). SAVE OPTIONS itself was not
+// found (it does not go through fn_0c06777e).
 namespace {
 bool g_reading_mode = false;
+int g_remember = -1;      // mode to store in the settings at the next vblank, -1 = none
+bool g_boot_reset = false, g_boot_done = false;
+
+void set_game_mode(dream::Memory& m, bool wide) {
+    m.write32(kMode, wide ? 1 : 0);
+    m.write8(kWideFlag, wide ? 1 : 0);
+}
 }  // namespace
 
 DC_HOOK_ENTRY(read_option_field) {
@@ -130,10 +183,21 @@ DC_HOOK_EXIT(read_option_field) {
     if (!g_reading_mode)
         return;
     g_reading_mode = false;
-    if (m.read32(kSavedMode) == 1) {
-        m.write32(kMode, 1);
-        m.write8(kWideFlag, 1);
-    }
+    const bool wide = m.read32(kSavedMode) == 1;
+    if (wide != game_wide(m))
+        set_game_mode(m, wide);
+    g_remember = wide ? 1 : 0;
+}
+
+DC_HOOK_ENTRY(set_resolution) {  // fn_0c04c31e(mode)
+    if (c.pr == 0x0C030644)      // the VIDEO menu
+        g_remember = c.r[4] == 1 ? 1 : 0;
+    return false;
+}
+
+DC_HOOK_ENTRY(boot_reset) {  // fn_0c04c3c0: volumes 127, mode 4:3
+    g_boot_reset = true;
+    return false;
 }
 
 // fn_0c036f00(obj, out, sx, sy, depth) turns a screen point into camera space with the current
@@ -148,17 +212,18 @@ float g_unproj_136 = 0.0f, g_unproj_144 = 0.0f;
 
 DC_HOOK_ENTRY(unproject) {
     g_unproj_cam = 0;
-    if (g_fov_widen == 1.0f || !game_wide(m))
-        return false;
     const std::uint32_t cam = m.read32(m.read32(c.r[4] + 96));
     const std::uint32_t type = m.read32(cam + 8);
-    if (type != 102 && type != 103)
+    const auto it = g_cam_widen.find(cam);
+    if ((type != 102 && type != 103) || it == g_cam_widen.end() || it->second.k == 1.0f ||
+        dreamcomp::read_f32(m, cam + 136) != it->second.f136)
         return false;
+    const float k = it->second.k;
     g_unproj_cam = cam;
     g_unproj_136 = dreamcomp::read_f32(m, cam + 136);
     g_unproj_144 = dreamcomp::read_f32(m, cam + 144);
-    dreamcomp::write_f32(m, cam + 136, g_unproj_136 * g_fov_widen);
-    dreamcomp::write_f32(m, cam + 144, g_unproj_144 / g_fov_widen);
+    dreamcomp::write_f32(m, cam + 136, g_unproj_136 * k);
+    dreamcomp::write_f32(m, cam + 144, g_unproj_144 / k);
     return false;
 }
 
@@ -225,7 +290,22 @@ void rename_wide_mode(dream::Memory& m) {
     }
 }
 
-void on_vblank(dream::System& sys, dreamcomp::Settings&) { rename_wide_mode(sys.memory); }
+void on_vblank(dream::System& sys, dreamcomp::Settings& settings) {
+    rename_wide_mode(sys.memory);
+    if (g_boot_reset && !g_boot_done) {  // the reset has run: set the remembered mode
+        g_boot_done = true;
+        if (settings.get("game_mode") == "adjusted")
+            set_game_mode(sys.memory, true);
+    }
+    if (g_remember >= 0) {
+        const char* v = g_remember ? "adjusted" : "4:3";
+        g_remember = -1;
+        if (settings.get("game_mode") != v) {
+            settings.set("game_mode", v);
+            settings.save();
+        }
+    }
+}
 
 const dreamcomp::PortInfo kInfo = [] {
     dreamcomp::PortInfo p;

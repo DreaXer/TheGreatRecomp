@@ -58,3 +58,6 @@ extra = [0x0C01D532,
 0x8C036F00 = "unproject"
 # Options file field reader: applies the saved resolution, which the game reads but never sets.
 0x8C06777E = "read_option_field"
+# Resolution setter (the VIDEO menu) and boot reset: the port remembers the mode across starts.
+0x8C04C31E = "set_resolution@entry"
+0x8C04C3C0 = "boot_reset@entry"

@@ -87,7 +87,20 @@ pr = 0x0C04C740), a 1 sets 0x8C2D0F44 = 1 and the flag = 1 as the menu does, and
 follow through fn_0c037134's mode check. Checked: boot with a 16:9 save -> flag 1, E0 1.2,
 E4 0.8333, VIDEO menu at 21:9 unstretched and showing "MODE 4/3" (the mode to switch to); with
 a 4:3 save -> flag 0, "MODE 16/9"; 0 untranslated / 0 unmapped over 9500 frames with LOAD;
-user, window, own VMU: both directions (save, restart) restored. fn_0c014460 (level load) forces 4:3 in level `Raycap` and puts
+user, window, own VMU: both directions (save, restart) restored.
+
+Before the VMU menu (~25 s of logos and title) the game is always 4:3, stretched in a wide
+window. The port remembers the mode in its settings, `game_mode = adjusted | 4:3`: stored when
+a save is loaded (its value) and when the VIDEO menu switches it (`fn_0c04c31e` entered with
+pr 0x0C030644; the Raycap level's forced 4:3 comes from fn_0c014460 and is ignored), and set
+at the first vblank after the boot reset fn_0c04c3c0 (entry hook; frame 307). Loading a save
+then sets its own value either way. SAVE OPTIONS was not found: it does not call fn_0c06777e
+and fn_0c04c84a does not run then. Checked with scratch settings files: remembered adjusted ->
+flag 1 at frame 1200, title screen at 21:9 unstretched; nothing remembered + 16:9 save loaded
+-> stored adjusted; adjusted remembered + 4:3 save loaded -> flag 0, stored 4:3; menu switch
+-> stored; user, window: stored on the first VMU load, title screen in the mode at the next
+start. The title screen's backdrop ends near the bottom-left corner: a sliver at 16:9 in
+the game's own mode, a larger wedge at 21:9 (not fixed). fn_0c014460 (level load) forces 4:3 in level `Raycap` and puts
 16:9 back after it (0x8C0C42A5 remembers).
 
 Camera, `fn_0c079ea0(cam, fov, ratio)`: `cam+120 = factor * fov` (horizontal FOV, full angle,
@@ -122,7 +135,16 @@ Wider than 16:9 (`src/rayman2.cpp`), `k = aspect / (16/9)`, while the flag is se
   divided by k after the call (x only);
 - entry+exit hook on 0x8C036F00: cam+136 * k and cam+144 / k (the 16:9 values) for the call, so
   screen-anchored objects keep their 16:9 size, centred, like the HUD (user's choice);
-- each vblank: `0x8C0C52E4 = 0.8333 / k`.
+- each vblank: `0x8C0C52E4 = 0.8333 / k`;
+- per perspective camera, the k its fields were derived with and the cam+136 it got. The intro
+  logo's camera (0x8CF1365C in the load-AAA run) is derived only when created (4 calls) but
+  placed and drawn with every frame (193 unproject calls), so a window reshaped while it shows
+  left it at the old k: flattened (user, window, changing the height). Each vblank, cameras
+  whose k differs have cam+136 scaled by k_old / k and cam+144 by k / k_old, only while cam+136
+  still holds the recorded value (else the entry is dropped, never written); unproject undoes
+  the camera's own k. Checked with a temporary mid-run switch of k at frame 5080 (TA at 5150):
+  1 -> 2 gives exactly the k = 2 run, 2 -> 1 exactly the 16:9 run; 16:9 menu TA identical to
+  the game's, 21:9 x 0.7619 / y 1.000.
 
 Earlier versions, as found: hooking the FOV setter fn_0c079ea0 left menu and logo cameras whose
 FOV is set once stretched (pause-menu lum, logos; user, window); widening cameras only made the

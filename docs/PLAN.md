@@ -32,3 +32,4 @@
 | 2026-11-09 | 214d790 + uncommitted | d6dfbb9 + playbook T28 | User, window: ultrawide (window resizing, subtitles, HUD, pause menu, Ubi Soft and Rayman 2 logos of a new game) with the game in its 16:9 mode; Claude, TA at 21:9 and shots at 32:9 (GAME-INTERNALS "Widescreen") |
 | 2026-11-09 | 214d790 + uncommitted | d6dfbb9 + playbook T28 | User, window, own VMU: the resolution saved with SAVE OPTIONS comes back at boot, 16:9 and 4:3 (GAME-INTERNALS "Saving") |
 | 2026-11-09 | 9760f20 + uncommitted | bd218fc + uncommitted (language setting) | User, launcher: Language row (default = Windows language, French here) and the game in the chosen language; Claude, shots: the renamed resolution label in all five languages (GAME-INTERNALS "Texts") |
+| 2026-11-09 | uncommitted | — | User, window: logos keep their shape while the window is reshaped; the resolution is remembered across starts (title screen in 16:9 before the VMU menu) |
