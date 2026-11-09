@@ -4,6 +4,7 @@
 #include <cmath>
 
 #include "dream/render/display_list.h"
+#include "dream/runtime/system.h"
 #include "dreamcomp/hook.h"
 #include "dreamcomp/port.h"
 #include "dreamcomp/settings.h"
@@ -44,18 +45,138 @@ const dreamcomp::PortInfo::Toggle kToggles[] = {
      true},
 };
 
-// The game has its own 16:9 mode (OPTIONS > VIDEO > RESOLUTION), drawn squeezed into 640x480.
-// The engine only has to unsqueeze it, so nothing is written to the game.
-// shortcut: the player must also pick 16:9 in the game's menu (else the 4:3 view is stretched);
-// upgrade by finding that option's RAM flag and setting it here.
-void apply_widescreen(dream::System&, float) {}
+// The game has its own 16:9 mode (OPTIONS > VIDEO > RESOLUTION), drawn squeezed into 640x480;
+// the engine unsqueezes it. Wider shapes start from that mode (docs/GAME-INTERNALS.md
+// "Widescreen"): the camera's horizontal FOV is widened so the vertical view stays the game's
+// 16:9 one, and the game's own 2D squeeze factor is narrowed to keep the HUD's proportions.
+// The player picks 16:9 in the game's menu once and saves it (SAVE OPTIONS); the save is
+// applied at boot below. With 4:3 picked, an Expanded window stretches the 4:3 view: by
+// choice, the port never forces the mode against the player's save.
+constexpr std::uint32_t kWideFlag = 0x8C0C52DC;  // byte, 1 = the game's 16:9 mode
+constexpr std::uint32_t kHudScale = 0x8C0C52E4;  // 2D width factor, 1/1.2 in 16:9 mode
+constexpr float kGameWide = 16.0f / 9.0f;
+float g_fov_widen = 1.0f;  // tan(h/2) factor over the game's 16:9 view; 1 = untouched
+
+bool game_wide(dream::Memory& m) { return m.read8(kWideFlag) != 0; }
+
+// SAVE OPTIONS stores the resolution in RAYMAN_2.SY_ and fn_0c04c61c decodes it into
+// kSavedMode at boot, applying the volumes but not the mode (docs/GAME-INTERNALS.md "Saving").
+constexpr std::uint32_t kSavedMode = 0x8C2D0F4C;  // 1 = 16:9 saved
+constexpr std::uint32_t kMode = 0x8C2D0F44;       // the menu's current setting
+
+void apply_widescreen(dream::System& sys, float aspect) {
+    g_fov_widen = aspect > 4.0f / 3.0f + 0.01f ? aspect / kGameWide : 1.0f;
+    if (game_wide(sys.memory))
+        dreamcomp::write_f32(sys.memory, kHudScale, (1.0f / 1.2f) / g_fov_widen);
+}
+
+}  // namespace
+
+// fn_0c037134(?, viewport, cam) derives each camera's projection, clip planes and culling every
+// frame from cam+120 (horizontal) and cam+124 (vertical). Perspective types 102/103: cam+120 is
+// the FOV (radians, full angle), widened for the call only, so cameras whose FOV is set once
+// (pause menu) widen too and nothing compounds. Orthographic types 100/101 (intro logos,
+// drawn at the near plane): type 101 copies cam+120 into cam+124, so widening cam+120 grew the
+// logos both ways; instead their x scale cam+140 is narrowed after the call, which keeps them
+// at their 16:9 size, centred, like the HUD.
+namespace {
+std::uint32_t g_cam = 0;  // camera the entry hook changed, 0 = none (no recursion seen)
+float g_cam_h = 0.0f, g_cam_wide = 0.0f;
+}  // namespace
+
+DC_HOOK_ENTRY(project_camera) {
+    g_cam = 0;
+    if (g_fov_widen == 1.0f || !game_wide(m))
+        return false;
+    const std::uint32_t cam = c.r[6];
+    const std::uint32_t type = m.read32(cam + 8);
+    const float h = dreamcomp::read_f32(m, cam + 120);
+    if (type == 100 || type == 101) {
+        g_cam = cam, g_cam_h = 0.0f;
+    } else if ((type == 102 || type == 103) && h > 0.0f && h < 3.0f) {
+        g_cam = cam, g_cam_h = h;
+        g_cam_wide = 2.0f * std::atan(std::tan(h * 0.5f) * g_fov_widen);
+        dreamcomp::write_f32(m, cam + 120, g_cam_wide);
+    }
+    return false;
+}
+
+DC_HOOK_EXIT(project_camera) {
+    if (!g_cam)
+        return;
+    if (g_cam_h == 0.0f)  // orthographic
+        dreamcomp::write_f32(m, g_cam + 140, dreamcomp::read_f32(m, g_cam + 140) / g_fov_widen);
+    else if (dreamcomp::read_f32(m, g_cam + 120) == g_cam_wide)  // unless the call re-derived it
+        dreamcomp::write_f32(m, g_cam + 120, g_cam_h);
+    g_cam = 0;
+}
+
+// fn_0c06777e(dest, ...) reads one field of the file; the loader calls it for kSavedMode from
+// 0x8C04C73C (pr 0x0C04C740). The loader's own exit is never reached by an exit hook (not
+// investigated), so the mode is set right after that field. Set it as the menu's fn_0c04c31e
+// does; each camera then takes the mode through fn_0c037134's own check (camera mode != flag
+// -> fn_0c03703a), as after a menu toggle. A 4:3 save leaves the boot default alone.
+namespace {
+bool g_reading_mode = false;
+}  // namespace
+
+DC_HOOK_ENTRY(read_option_field) {
+    g_reading_mode = c.r[4] == kSavedMode && c.pr == 0x0C04C740;
+    return false;
+}
+
+DC_HOOK_EXIT(read_option_field) {
+    if (!g_reading_mode)
+        return;
+    g_reading_mode = false;
+    if (m.read32(kSavedMode) == 1) {
+        m.write32(kMode, 1);
+        m.write8(kWideFlag, 1);
+    }
+}
+
+// fn_0c036f00(obj, out, sx, sy, depth) turns a screen point into camera space with the current
+// camera [[obj+96]]: perspective uses cam+136 (0.1 / tan(h/2), widened: / k) and cam+144 (y
+// scale, -3200 * tan(h/2) / tan(v/2), widened: * k). Screen-anchored objects (the intro logos)
+// are placed with it, so with the widened values they came closer and grew by k. Give it the
+// game's 16:9 values for the call: they keep their 16:9 size, centred, like the HUD.
+namespace {
+std::uint32_t g_unproj_cam = 0;
+float g_unproj_136 = 0.0f, g_unproj_144 = 0.0f;
+}  // namespace
+
+DC_HOOK_ENTRY(unproject) {
+    g_unproj_cam = 0;
+    if (g_fov_widen == 1.0f || !game_wide(m))
+        return false;
+    const std::uint32_t cam = m.read32(m.read32(c.r[4] + 96));
+    const std::uint32_t type = m.read32(cam + 8);
+    if (type != 102 && type != 103)
+        return false;
+    g_unproj_cam = cam;
+    g_unproj_136 = dreamcomp::read_f32(m, cam + 136);
+    g_unproj_144 = dreamcomp::read_f32(m, cam + 144);
+    dreamcomp::write_f32(m, cam + 136, g_unproj_136 * g_fov_widen);
+    dreamcomp::write_f32(m, cam + 144, g_unproj_144 / g_fov_widen);
+    return false;
+}
+
+DC_HOOK_EXIT(unproject) {
+    if (!g_unproj_cam)
+        return;
+    dreamcomp::write_f32(m, g_unproj_cam + 136, g_unproj_136);
+    dreamcomp::write_f32(m, g_unproj_cam + 144, g_unproj_144);
+    g_unproj_cam = 0;
+}
+
+namespace {
 
 const dreamcomp::PortInfo kInfo = [] {
     dreamcomp::PortInfo p;
     p.id = "rayman2";
     p.title = "Rayman 2: The Great Escape";
     p.widescreen = &apply_widescreen;
-    p.max_aspect = 16.0f / 9.0f;  // the game's own mode is 16:9 only
+    p.max_aspect = 32.0f / 9.0f;  // past 16:9 through set_camera_fov
     p.on_frame = &on_frame;
     p.graphics_toggles = kToggles;
     p.graphics_toggle_count = 1;

@@ -51,3 +51,10 @@ extra = [0x0C01D532,
          0x0C038D20]
 
 # [hooks]: see dreamcomp docs/HOOKS.md.
+[hooks]
+# Per-frame camera projection (docs/GAME-INTERNALS.md "Widescreen"): widened past 16:9.
+0x8C037134 = "project_camera"
+# Screen point to camera space (places the intro logos): given the 16:9 projection.
+0x8C036F00 = "unproject"
+# Options file field reader: applies the saved resolution, which the game reads but never sets.
+0x8C06777E = "read_option_field"
